@@ -7,6 +7,10 @@
 > 為什麼用 Mega 學 FreeRTOS？Mega 腳位多、4 組硬體序列埠，方便同時觀察多個 task 的行為。
 > 但要注意 **ATmega1280 只有 8 KB SRAM**，task 數量與 stack 大小要省著用。
 
+> 📌 **分支說明**：本 `freertos` 分支只放 FreeRTOS 進階實驗。
+> 若你是第一次接觸這塊板子，請先看 **`main` 分支** —— 那裡有板子檢測方法、
+> Flash 韌體分析、版本差異，以及 blink／序列埠／按鈕／類比／PWM 等基礎 Labs。
+
 ---
 
 ## 0. 什麼是 FreeRTOS？（一分鐘版）

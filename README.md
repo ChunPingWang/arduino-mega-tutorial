@@ -4,6 +4,10 @@
 
 > 本次實測的板子為 **原版 Arduino Mega（ATmega1280）**，採用 FTDI FT232R 作為 USB 轉序列晶片。
 
+> 📌 **分支說明**：本 `main` 分支放的是基礎教學（板子檢測、Flash 韌體分析、版本差異、
+> 以及 blink／序列埠／按鈕／類比／PWM 等基礎 Labs）。
+> 想學多工（task、queue、mutex、semaphore）請切到 **`freertos` 分支**，那裡有 FreeRTOS 進階實驗。
+
 ---
 
 ## 0. 環境需求

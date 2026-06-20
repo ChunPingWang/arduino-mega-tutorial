@@ -208,6 +208,289 @@ strings sketch_backup.bin
 
 ---
 
+## 8. Flash 程式實際分析範例
+
+本次把整顆 128 KB flash 讀出後做的分析，示範如何在「沒有任何可讀字串」的情況下，
+仍能判斷板子在做什麼。
+
+### 8.1 量測實際用量
+
+```bash
+# 將 hex 轉為 binary（系統若無 avr-objcopy，可用一般 objcopy）
+objcopy -I ihex sketch_backup.hex -O binary sketch_backup.bin
+
+# 統計非 0xFF（已燒錄）位元組、找出程式最高位址
+python3 -c "b=open('sketch_backup.bin','rb').read(); \
+print('used', sum(1 for x in b if x!=0xFF), 'of', len(b))"
+```
+
+實測結果：
+
+| 區段 | 內容 | 大小 |
+|---|---|---|
+| 應用程式 `0x00000–0x01307` | 使用者 sketch | 約 4.8 KB |
+| Bootloader `0x1F000–0x1FF15` | ATmegaBOOT | 約 3.7 KB |
+| 其餘 | 未燒錄（`0xFF`） | — |
+
+整顆 flash 只用了 **約 6%**。唯一可讀字串位於 bootloader 區：
+`ATmegaBOOT / Arduino Mega - (C) Arduino LLC - 090930`（日期 2009-09-30），
+應用程式區則**完全沒有可讀字串**（與序列埠靜默的觀察一致）。
+
+### 8.2 解析中斷向量表（關鍵技巧）
+
+沒有字串時，可解析 **中斷向量表（interrupt vector table）** 來推斷用到哪些周邊。
+ATmega1280 的向量表在 flash 開頭，共 57 個項目、每個 4 bytes（一道 `jmp`）。
+未使用的中斷會全部指向同一個「bad interrupt」位址；指向**獨立位址**的才是真正啟用的。
+
+```bash
+# 解析向量表，列出有安裝真正處理常式的中斷
+python3 parse_vectors.py   # 見 analysis/ 目錄
+```
+
+實測啟用的中斷：
+
+| 中斷向量 | 意義 |
+|---|---|
+| `TIMER0_OVF` | Arduino 核心的 `millis()` / `delay()` 計時器（每個 sketch 都有） |
+| `USART0_RX` | Serial（USB）接收中斷 |
+| `USART1_RX` | Serial1 接收中斷 |
+| `USART2_RX` | Serial2 接收中斷 |
+| `USART3_RX` | Serial3 接收中斷 |
+
+### 8.3 結論判讀
+
+- 板子對 **四個硬體序列埠（Serial / Serial1 / Serial2 / Serial3）全部呼叫了 `begin()`**
+  （四個 USART 的 RX 中斷都已安裝）。
+- 只有 RX 中斷、沒有持續的 TX（UDRE）中斷，且 USB 端觀察不到主動輸出
+  → 程式會**監聽**各埠，但不會主動往 USB 印東西。
+- 綜合判斷：最符合的功能是 **多埠序列轉接／閘道（serial bridge / gateway / router）**
+  ——把多個 UART 的資料互相轉送。確切邏輯需反組譯（`avr-objdump -m avr`）才能 100% 確認，
+  但向量表已足以指出它「用到全部四個序列埠」。
+
+> 重點方法論：**字串 → 向量表 → 反組譯**，由淺入深。即使程式不輸出任何文字，
+> 向量表也會誠實地透露它啟用了哪些周邊（計時器、UART、I²C、SPI、ADC、外部中斷……）。
+
+---
+
+## 9. 新版 Arduino Mega 有什麼不同？
+
+本次實測的是最早期的 **Mega 1280**。市面上「新版」一般指 **Mega 2560**（尤其是 R3）。
+主要差異如下：
+
+### 9.1 核心晶片：ATmega1280 → ATmega2560
+
+| 項目 | Mega 1280（舊） | Mega 2560（新） |
+|---|---|---|
+| Flash | 128 KB | **256 KB** |
+| SRAM | 8 KB | 8 KB（相同） |
+| EEPROM | 4 KB | 4 KB（相同） |
+| Signature | `1E 97 03` | `1E 98 01` |
+| 數位 / 類比腳位 | 54 / 16 | 54 / 16（相同） |
+
+→ 最大實質差異是 **flash 加倍到 256 KB**，可放更大的程式。
+
+### 9.2 USB 轉序列晶片：FTDI → ATmega8U2 / 16U2
+
+| 版本 | USB 晶片 | 裝置節點 |
+|---|---|---|
+| Mega 1280 / 早期 | FTDI FT232RL | `/dev/ttyUSB*` |
+| Mega 2560 R1 / R2 | ATmega8U2 | `/dev/ttyACM*` |
+| Mega 2560 R3 | **ATmega16U2** | `/dev/ttyACM*` |
+
+→ 新版改用 Atmel 自家 MCU 做 USB（原生 USB CDC），不再依賴 FTDI 驅動；
+16U2 韌體可重刷，能模擬鍵盤／滑鼠等 USB 裝置。
+
+### 9.3 Bootloader 協定與鮑率
+
+| 版本 | programmer | 鮑率 | avrdude 參數 |
+|---|---|---|---|
+| Mega 1280（舊） | STK500v1（`arduino`） | **57600** | `-c arduino -p atmega1280 -b 57600` |
+| Mega 2560（新） | STK500v2（`wiring`） | **115200** | `-c wiring -p atmega2560 -b 115200` |
+
+→ 這也是為什麼本次一開始用 `wiring`/115200 會 timeout：協定與鮑率對新版才正確。
+
+### 9.4 R3 改版的接腳新增
+
+Mega 2560 **R3** 相對於更早版本，額外新增：
+
+- **SDA / SCL** 兩支 I²C 專用腳（移到 AREF 旁，與 Uno R3 對齊，方便 shield 共用）
+- **IOREF** 腳：讓 shield 偵測板子工作電壓（5V / 3.3V）
+- 多一支 **GND** 與一支保留腳
+- 改良的自動重置（auto-reset）電路
+
+### 9.5 一句話總結
+
+> 新版（Mega 2560 R3）相對舊版（Mega 1280）：**flash 加倍（256 KB）、USB 改用可重刷的
+> 16U2（走 `ttyACM`、原生 USB）、bootloader 改為 `wiring`/115200、並新增 SDA/SCL 與 IOREF 腳**；
+> CPU 速度、腳位數量、SRAM/EEPROM 容量則維持不變。
+
+---
+
+## 10. 新手實驗（Labs）
+
+以下實驗專為初學者設計，由淺入深。每個實驗都包含：**目標 → 接線 → 程式碼 → 上傳 → 預期結果**。
+
+### 上傳前準備
+
+**用 Arduino IDE：**
+
+1. `工具 → 開發板 → Arduino AVR Boards → Arduino Mega or Mega 2560`
+2. 本次實測是舊版 1280，需設定 `工具 → 處理器 → ATmega1280`（2560 板則選 ATmega2560）
+3. `工具 → 連接埠 → /dev/ttyUSB0`
+4. 按上傳（→）
+
+**用 arduino-cli（命令列）：**
+
+```bash
+# 安裝後先抓核心
+arduino-cli core install arduino:avr
+
+# 編譯 + 上傳（1280 板用此 FQBN；2560 板改 cpu=atmega2560）
+arduino-cli compile -b arduino:avr:mega:cpu=atmega1280 lab01_blink
+arduino-cli upload  -b arduino:avr:mega:cpu=atmega1280 -p /dev/ttyUSB0 lab01_blink
+```
+
+> 註：序列埠監看的鮑率由程式中的 `Serial.begin(n)` 決定，與上傳鮑率（1280 為 57600）無關。
+
+---
+
+### Lab 1 — 內建 LED 閃爍（Blink）
+
+**目標**：點亮並閃爍板上內建 LED（接在 pin 13）。不需任何外接零件。
+
+```cpp
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);   // Mega 的 LED_BUILTIN = 13
+}
+void loop() {
+  digitalWrite(LED_BUILTIN, HIGH);
+  delay(500);
+  digitalWrite(LED_BUILTIN, LOW);
+  delay(500);
+}
+```
+
+**預期結果**：板上 L 燈每 0.5 秒閃一次。改 `delay` 數值可變快或變慢。
+
+---
+
+### Lab 2 — 序列埠印出 Hello（Serial）
+
+**目標**：透過 USB 序列埠印字到電腦。學會 `Serial.print` 與序列埠監看。
+
+```cpp
+void setup() {
+  Serial.begin(9600);
+}
+void loop() {
+  Serial.println("Hello Arduino Mega!");
+  delay(1000);
+}
+```
+
+**上傳後**用以下任一方式監看（鮑率設 9600）：
+
+```bash
+arduino-cli monitor -p /dev/ttyUSB0 -c baudrate=9600
+# 或本文件第 6 節的 Python 監聽腳本
+```
+
+**預期結果**：每秒出現一行 `Hello Arduino Mega!`。
+
+---
+
+### Lab 3 — 按鈕讀取（digitalRead）
+
+**目標**：讀取按鈕狀態並用內建 LED 顯示。
+
+**接線**：按鈕一腳接 pin 2，另一腳接 GND（使用內建上拉電阻，按下為 LOW）。
+
+```cpp
+const int BTN = 2, LED = 13;
+void setup() {
+  pinMode(BTN, INPUT_PULLUP);
+  pinMode(LED, OUTPUT);
+}
+void loop() {
+  bool pressed = (digitalRead(BTN) == LOW);
+  digitalWrite(LED, pressed ? HIGH : LOW);
+}
+```
+
+**預期結果**：按住按鈕時 LED 亮，放開即滅。
+
+---
+
+### Lab 4 — 類比讀取（analogRead）
+
+**目標**：讀電位器（可變電阻）的電壓，印出 0–1023 的數值。
+
+**接線**：電位器兩端接 5V 與 GND，中間（滑動端）接 A0。
+
+```cpp
+void setup() {
+  Serial.begin(9600);
+}
+void loop() {
+  int v = analogRead(A0);          // 0..1023（10-bit ADC）
+  float volt = v * 5.0 / 1023.0;
+  Serial.print(v);
+  Serial.print("  ");
+  Serial.print(volt, 2);
+  Serial.println(" V");
+  delay(200);
+}
+```
+
+**預期結果**：轉動電位器，序列埠數值在 0–1023、電壓在 0–5V 之間變化。
+
+---
+
+### Lab 5 — PWM 呼吸燈（analogWrite）
+
+**目標**：用 PWM 讓 LED 由暗到亮漸變（呼吸效果）。
+
+**接線**：LED 經 220Ω 電阻接 pin 9（Mega 的 PWM 腳之一），另一端接 GND。
+
+```cpp
+const int LED = 9;               // 必須是 PWM 腳（~ 記號）
+void setup() {
+  pinMode(LED, OUTPUT);
+}
+void loop() {
+  for (int b = 0; b <= 255; b++) { analogWrite(LED, b); delay(5); }
+  for (int b = 255; b >= 0; b--) { analogWrite(LED, b); delay(5); }
+}
+```
+
+**預期結果**：LED 平滑地由暗變亮再變暗，像呼吸一樣。
+
+---
+
+### Lab 6 — 多序列埠橋接（Serial1，Mega 專屬）
+
+**目標**：體驗 Mega 才有的 **第二組硬體序列埠**（共 4 組）。把 USB 收到的字轉送到 Serial1，反之亦然——正是本文件第 8 節分析出的「多埠橋接」雛形。
+
+**接線**：外接裝置（如另一片 Arduino 或藍牙模組）接 Mega 的 **TX1=18 / RX1=19**。
+
+```cpp
+void setup() {
+  Serial.begin(9600);    // USB
+  Serial1.begin(9600);   // 第二組 UART（腳位 18/19）
+}
+void loop() {
+  if (Serial.available())  Serial1.write(Serial.read());  // USB -> 裝置
+  if (Serial1.available()) Serial.write(Serial1.read());  // 裝置 -> USB
+}
+```
+
+**預期結果**：從電腦序列埠輸入的字會送到接在 Serial1 的裝置；裝置回傳的字會顯示在電腦上。
+
+> 進階：Mega 還有 `Serial2`（16/17）與 `Serial3`（14/15）。把四個都 `begin()` 起來，
+> 就是本文件第 8 節從 flash 向量表推斷出的那種「四埠序列閘道」。
+
+---
+
 ## 附錄：本次實測板子摘要
 
 | 項目 | 值 |
